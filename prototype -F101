@@ -1,0 +1,196 @@
+WITH 
+-- 1. Последние даты остатков на начало периода  
+last_dates_incoming as (
+    SELECT account, MAX(date_carry) as max_date_carry
+    FROM bank.restdate_dbt 
+    where date_carry < '2021-05-01' 
+    GROUP BY account
+),
+-- 2.Последние даты остатков на конец периода
+last_dates_outgoing as (
+    SELECT account, MAX(date_carry) as max_date_carry
+    FROM bank.restdate_dbt 
+    where date_carry < '2021-06-01' 
+    GROUP BY account
+),
+
+-- 3. Выбираем активные счета (А/П) на отчетный период
+filtered_accounts as (
+    SELECT 
+        account, 
+        balance, 
+        chapter, 
+        kind_Account, 
+        Code_Currency
+    FROM bank.account_dbt
+    where (Kind_Account = 'А' or Kind_Account = 'П')
+      and Open_Date <= '2021-05-31' 
+      and (Close_Date IS NULL or Close_Date >= '2021-05-01')
+	  and account in (SELECT distinct ac.account
+	FROM bank.account_dbt ac
+	where ac.Kind_Account in ('А', 'П')
+				and ac.Open_Date <= '2021-05-31' 
+				and (Close_Date IS NULL or Close_Date >= '2021-05-01')
+				and EXISTS (SELECT 1 
+							FROM bank.arhdoc_dbt ar
+							where (ac.account = ar.Real_Payer or ac.account = ar.Real_Receiver) 
+                            and ar.chapter=ac.chapter
+							and ar.date_carry BETWEEN '2021-05-01' and '2021-05-31')
+
+				union
+						select distinct tt.account
+						from (SELECT account, max(date_carry) as carry, chapter
+								FROM bank.restdate_dbt
+								where date_carry<='2021-05-31'
+								group by account, chapter) as tt
+						join bank.restdate_dbt as r on tt.account=r.account 
+                        and tt.carry =r.date_carry and tt.chapter=r.chapter
+						where r.rest != 0 and exists(select 1 from bank.account_dbt as ac 
+						where ac.account=r.account and ac.Kind_Account in ('А', 'П') and ac.chapter=r.chapter
+													))
+),
+
+-- 3. Входящие остатки на 01.05.2021 
+incoming_balances as (SELECT 
+                        ac.balance,
+                        ac.chapter,
+                        kind_Account,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____810%' THEN rest ELSE 0 END)/1000)) as VR,
+        ROUND(ABS(SUM(case WHEN re.account NOT LIKE '_____810%' THEN rest ELSE 0 END)/1000)) as VC,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____098%' THEN rest ELSE 0 END)/1000)) as VG,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____099%' or
+        re.account LIKE '_____076%' or
+        re.account LIKE '_____033%' THEN rest ELSE 0 END)/1000)) as VM,
+        ROUND(ABS(SUM(rest)/1000)) as VITG
+    FROM filtered_accounts ac
+    JOIN bank.restdate_dbt re on re.account = ac.account 
+                             and re.Chapter = ac.chapter 
+                             and re.Code_Currency = ac.Code_Currency 
+    JOIN last_dates_incoming ld on re.account = ld.account and re.date_carry = ld.max_date_carry
+    where re.Code_Currency = 0
+    GROUP BY ac.balance, ac.chapter, ac.kind_Account
+),
+
+--4.Обороты за период с 01.05.2021 по 31.05.2021 
+turnovers as ( SELECT 
+                ac.balance,
+                ac.chapter,
+                ac.kind_Account,
+                ac.Code_Currency,
+
+    --Сумма дебетовых оборотов
+
+    SUM(case WHEN ar.Real_Payer = ac.account and ac.account LIKE '_____810%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_ora,
+    
+    SUM(case WHEN ar.Real_Payer = ac.account and ac.account NOT LIKE '_____810%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_oca,
+    
+    SUM(case WHEN ar.Real_Payer = ac.account and ac.account LIKE '_____098%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_oga,
+    
+    SUM(case WHEN ar.Real_Payer = ac.account and (ac.account LIKE '_____099%' or ac.account LIKE '_____076%' or ac.account LIKE '_____033%') THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_oma,
+
+    --Сумма кредитовых оборотов
+
+    SUM(case WHEN ar.Real_Receiver = ac.account and ac.account LIKE '_____810%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_orp,
+    
+    SUM(case WHEN ar.Real_Receiver = ac.account and ac.account NOT LIKE '_____810%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_ocp,
+    
+    SUM(case WHEN ar.Real_Receiver = ac.account and ac.account LIKE '_____098%' THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_ogp,
+    
+    SUM(case WHEN ar.Real_Receiver = ac.account and (ac.account LIKE '_____099%' or ac.account LIKE '_____076%' or ac.account LIKE '_____033%') THEN 
+        case WHEN ar.code_currency = ac.Code_Currency THEN ar.sum ELSE 0 END 
+    ELSE 0 END) as sum_omp
+FROM filtered_accounts ac
+JOIN bank.arhdoc_dbt ar on (ac.account = ar.Real_Payer or ac.account = ar.Real_Receiver)
+where ar.date_carry BETWEEN '2021-05-01' and '2021-05-31'
+ and ac.code_currency = 0  -- Только валютные счета (предполагая, что 0 - код валюты)
+ and ar.Real_Payer != ar.Real_Receiver
+ and ar.code_currency = ac.Code_Currency  -- Только операции в той же валюте, что и счет
+GROUP BY ac.balance, ac.chapter, ac.kind_Account, ac.Code_Currency
+),
+
+-- 5. Исходящие остатки на 01.06.2021 
+outgoing_balances as (
+    SELECT 
+        ac.balance,
+        ac.chapter,
+        kind_Account,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____810%' THEN rest ELSE 0 END)/1000)) as IR,
+        ROUND(ABS(SUM(case WHEN re.account NOT LIKE '_____810%' THEN rest ELSE 0 END)/1000)) as IC,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____098%' THEN rest ELSE 0 END)/1000)) as IG,
+        ROUND(ABS(SUM(case WHEN re.account LIKE '_____099%' or
+ re.account LIKE '_____076%' or
+ re.account LIKE '_____033%' THEN rest ELSE 0 END)/1000)) as IM,
+        ROUND(ABS(SUM(rest)/1000)) as IITG
+    FROM filtered_accounts ac
+    JOIN bank.restdate_dbt re on re.account = ac.account 
+                             and re.Chapter = ac.chapter 
+                             and re.Code_Currency = ac.Code_Currency 
+    JOIN last_dates_outgoing ld on re.account = ld.account and re.date_carry = ld.max_date_carry
+    where re.Code_Currency = 0
+    GROUP BY ac.balance, ac.chapter, ac.kind_Account
+)
+
+-- 6. Основной запрос
+SELECT DISTINCT on (ac.balance)
+    case 
+        WHEN ac.chapter = 1 THEN 'А.Балансовые счета'
+        WHEN ac.chapter = 2 THEN 'Б.Счета доверительного управления'
+        WHEN ac.chapter = 3 THEN 'В.Внебалансовые счета'
+        WHEN ac.chapter = 4 THEN 'Г.Срочные операции'
+        ELSE 'Неизвестный раздел'
+    END as PLAN,
+    ac.balance as NUM_SC,
+    case
+        WHEN ac.kind_Account = 'А' THEN 'a' 
+        WHEN ac.kind_Account = 'П' THEN 'p'
+        ELSE 'н'
+    END as A_P,
+    '2021-06-01' as DT,
+    -- Входящие остатки
+    COALESCE(ib.VR, 0) as VR,
+    COALESCE(ib.VC, 0) as VC,
+    COALESCE(ib.VG, 0) as VG,
+    COALESCE(ib.VM, 0) as VM,
+    COALESCE(ib.VITG, 0) as VITG,
+    -- Обороты
+    COALESCE(ROUND(ABS(t.sum_ora)/1000), 0) as ORA,
+    COALESCE(ROUND(ABS(t.sum_oca)/1000), 0) as OCA,
+    COALESCE(ROUND(ABS(t.sum_oga)/1000), 0) as OGA,
+    COALESCE(ROUND(ABS(t.sum_oma)/1000), 0) as OMA,
+    COALESCE(ROUND(ABS(t.sum_ora + t.sum_oca + t.sum_oga + t.sum_oma)/1000), 0) as OITGA,
+    COALESCE(ROUND(ABS(t.sum_orp)/1000), 0) as ORP,
+    COALESCE(ROUND(ABS(t.sum_ocp)/1000), 0) as OCP,
+    COALESCE(ROUND(ABS(t.sum_ogp)/1000), 0) as OGP,
+    COALESCE(ROUND(ABS(t.sum_omp)/1000), 0) as OMP,
+    COALESCE(ROUND(ABS(t.sum_orp + t.sum_ocp + t.sum_ogp + t.sum_omp)/1000), 0) as OITGP,
+    -- Исходящие остатки
+    COALESCE(ob.IR, 0) as IR,
+    COALESCE(ob.IC, 0) as IC,
+    COALESCE(ob.IG, 0) as IG,
+    COALESCE(ob.IM, 0) as IM,
+    COALESCE(ob.IITG, 0) as IITG
+FROM filtered_accounts ac
+LEFT JOIN incoming_balances ib on ib.balance = ac.balance
+                     and ib.chapter = ac.chapter
+                     and ib.kind_Account = ac.kind_Account
+LEFT JOIN turnovers t on ac.balance = t.balance
+                     and ac.chapter = t.chapter
+                     and ac.kind_Account = t.kind_Account
+LEFT JOIN outgoing_balances ob on ac.balance = ob.balance
+                             and ac.chapter = ob.chapter
+                             and ac.kind_Account = ob.kind_Account
+ORDER BY ac.balance, ac.chapter, ac.kind_Account;
